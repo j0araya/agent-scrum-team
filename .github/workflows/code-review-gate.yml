@@ -1,0 +1,145 @@
+name: Code Review Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  code-review:
+    name: Automated Code Review (Best Practices Gate)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          separator: "\n"
+
+      - name: Run OpenCode Code Reviewer Agent
+        id: review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Install opencode
+          curl -fsSL https://raw.githubusercontent.com/opencode-ai/opencode/refs/heads/main/install | bash
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Gather diff for review
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- . \
+            ':(exclude)*.lock' \
+            ':(exclude)package-lock.json' \
+            ':(exclude)yarn.lock' \
+            ':(exclude)*.min.js' \
+            ':(exclude)*.min.css' | head -c 15000)
+
+          # Run the code reviewer agent
+          REVIEW_OUTPUT=$(opencode -q -p "
+          You are the Code Reviewer Agent. Review the following git diff for best practices violations.
+
+          ## Review Checklist
+          - No dead code, debug statements, or commented-out blocks
+          - Functions are small and single-responsibility
+          - No hardcoded secrets, API keys, or credentials
+          - Inputs validated and sanitized (no injection vulnerabilities)
+          - DRY — no duplicated logic
+          - Meaningful naming conventions
+          - Async operations handled correctly
+          - No obvious performance issues (N+1, expensive loops)
+          - Tests included for new logic
+          - Public functions/APIs documented
+
+          ## Git Diff to Review:
+          \`\`\`diff
+          $DIFF
+          \`\`\`
+
+          ## Output Format:
+          Start your response with either:
+          - 'VERDICT: APPROVED' if all checks pass
+          - 'VERDICT: REJECTED' if any critical/high issues found
+
+          Then list all findings with severity (Critical/High/Medium/Low), file, description, and required action.
+          If REJECTED, clearly list what must be fixed before re-submit.
+          ")
+
+          echo "REVIEW_OUTPUT<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Determine verdict
+          if echo "$REVIEW_OUTPUT" | grep -q "VERDICT: APPROVED"; then
+            echo "verdict=approved" >> $GITHUB_OUTPUT
+          else
+            echo "verdict=rejected" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post review comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const verdict = '${{ steps.review.outputs.verdict }}';
+            const reviewOutput = `${{ steps.review.outputs.REVIEW_OUTPUT }}`;
+            const isApproved = verdict === 'approved';
+
+            const header = isApproved
+              ? '## Code Review: APPROVED\n> All best practice checks passed. Ready to merge.'
+              : '## Code Review: REJECTED — Returned to Dev Board\n> Issues were found that must be resolved before this PR can be merged.';
+
+            const body = `${header}\n\n---\n\n${reviewOutput}\n\n---\n_Reviewed by: Code Reviewer Agent_`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Approve PR (if passed)
+        if: steps.review.outputs.verdict == 'approved'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'APPROVE',
+              body: 'Code Reviewer Agent: All best practice checks passed. Approved for merge.'
+            });
+
+      - name: Request changes (if rejected)
+        if: steps.review.outputs.verdict == 'rejected'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'REQUEST_CHANGES',
+              body: 'Code Reviewer Agent: Issues found. See PR comment for details. Fix all CRITICAL and HIGH issues and re-submit.'
+            });
+
+      - name: Fail pipeline if rejected
+        if: steps.review.outputs.verdict == 'rejected'
+        run: |
+          echo "Code review REJECTED. PR has been returned to the dev board."
+          exit 1

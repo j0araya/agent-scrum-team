@@ -1,0 +1,17 @@
+{
+  "agents": {
+    "coder": {
+      "model": "claude-sonnet-4-5",
+      "maxTokens": 8000
+    },
+    "task": {
+      "model": "claude-sonnet-4-5",
+      "maxTokens": 8000
+    },
+    "title": {
+      "model": "claude-sonnet-4-5",
+      "maxTokens": 80
+    }
+  },
+  "autoCompact": true
+}
